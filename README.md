@@ -73,28 +73,43 @@ show **running** (or **exited** for `minio_init`, which is a one-shot job).
 
 ### 5. Create the topic and start the producer
 
-Create the Kafka topic (do this once after the stack is up):
+**Create the Kafka topic** (do this once after the stack is up):
 
 ```bash
 docker exec kafka sh -c "/opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server localhost:9092 \
+  --bootstrap-server localhost:9094 \
   --create --topic taxi-trips --partitions 3 --replication-factor 1"
 ```
 
-Then open a **Jupyter terminal** (File → New Terminal in JupyterLab) and run:
+**HOST MODE** (recommended for grading — run from your machine):
 
 ```bash
-python project/produce.py             # 5 events/s, single pass (January data)
-python project/produce.py --loop      # replay indefinitely
-python project/produce.py --rate 20   # faster replay
-python project/produce.py --data data/yellow_tripdata_2025-02.parquet  # February data
+python produce.py             # 5 events/s, single pass (January data)
+python produce.py --loop      # replay indefinitely
+python produce.py --rate 20   # faster: 20 events/s
+python produce.py --data-file data/yellow_tripdata_2025-02.parquet  # February data
 ```
 
-Or from a host terminal:
+**CONTAINER MODE** (run inside Docker — Jupyter terminal or docker exec):
+
+If you want to run the producer inside the Docker network, use `kafka:9092`:
 
 ```bash
-docker exec project2_jupyter python /home/jovyan/project/produce.py --loop
+# In Jupyter terminal (File → New Terminal):
+python project/produce.py --bootstrap kafka:9092
+
+# Or via docker exec from host:
+docker exec project2_jupyter python /home/jovyan/project/produce.py --bootstrap kafka:9092 --loop
 ```
+
+**Execution Modes Explained:**
+
+| Mode | Command | Bootstrap | Use Case |
+|------|---------|-----------|----------|
+| **Host** (default) | `python produce.py` | `localhost:9094` | Grading, local testing from your machine |
+| **Container** | `--bootstrap kafka:9092` | `kafka:9092` | Testing inside Docker, Jupyter notebook |
+
+The `--bootstrap` flag overrides the default. Host mode is the default and works from your PowerShell/bash directly.
 
 ### 6. Open Jupyter
 

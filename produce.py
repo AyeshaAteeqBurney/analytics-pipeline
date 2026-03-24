@@ -5,22 +5,36 @@ Replays NYC taxi trip rows as JSON events into a Kafka topic.
 Reads all parquet files from data/inbox/ (or a specific file) row by row and publishes
 each row as a JSON message. After row 500 of each file, adds airport_fee: 1.75 field.
 
-Designed to run from inside the Docker Compose network (Jupyter terminal or
-docker exec).
+EXECUTION MODES:
+  Host Mode (default):
+    - Run `python produce.py` from PowerShell or bash on your machine
+    - Connects to Kafka at localhost:9094 (exposed host port)
+    - Use this for grading and local testing
+    
+  Container Mode:
+    - Run from inside Docker (Jupyter terminal or docker exec)
+    - Connects to Kafka at kafka:9092 (internal Docker hostname)
+    - Only needed if testing inside the Docker network
 
 Usage
 -----
-From a Jupyter terminal (File → New Terminal):
-    python project/produce.py                    # Finds all .parquet files in data/inbox/
+# Host mode (default) — run from your machine
+    python produce.py
 
-From a host terminal:
-    docker exec project2_jupyter python /home/jovyan/project/produce.py
+# Specify custom host bootstrap server (port 9094 is default for host mode):
+    python produce.py --bootstrap localhost:9094
+
+# Container mode — run inside Docker (e.g., from Jupyter terminal):
+    python project/produce.py --bootstrap kafka:9092
+    
+# Or via docker exec:
+    docker exec project2_jupyter python /home/jovyan/project/produce.py --bootstrap kafka:9092
 
 Options:
     --data-dir  Directory containing parquet files (default: data/inbox/)
     --data-file Specific parquet file to replay    (optional; if set, uses this file only)
     --topic     Kafka topic to publish to          (default: taxi-trips)
-    --bootstrap Kafka bootstrap server             (default: kafka:9092)
+    --bootstrap Kafka bootstrap server             (default: localhost:9094 for host mode)
     --rate      Events per second                  (default: 5.0)
     --loop      Replay the file indefinitely       (flag, default: off)
 
@@ -89,8 +103,8 @@ def main() -> None:
                              "If omitted, discovers all .parquet files in --data-dir.")
     parser.add_argument("--topic",     default="taxi-trips",
                         help="Target Kafka topic.")
-    parser.add_argument("--bootstrap", default="kafka:9092",
-                        help="Kafka bootstrap server.")
+    parser.add_argument("--bootstrap", default="localhost:9094",
+                        help="Kafka bootstrap server (default: localhost:9094 for host mode; use kafka:9092 for container mode).")
     parser.add_argument("--rate",      type=float, default=5.0,
                         help="Events per second.")
     parser.add_argument("--loop",      action="store_true",
@@ -148,7 +162,8 @@ def main() -> None:
         sys.exit(
             "Could not reach Kafka. Make sure the stack is running:\n"
             "  docker compose up -d\n"
-            "and that you are inside the Docker network (Jupyter terminal or docker exec)."
+            "Host mode: use --bootstrap localhost:9094\n"
+            "Container mode: use --bootstrap kafka:9092"
         )
 
     print(f"Topic    : {args.topic}")
