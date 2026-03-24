@@ -149,17 +149,52 @@ Two message shapes coexist in Bronze without data loss:
 
 ## 7. How to run
 
+**Prerequisites:**
+- Place parquet files in `data/` directory:
+  - `data/yellow_tripdata_2025-01.parquet`
+  - `data/yellow_tripdata_2025-02.parquet`
+  - `data/taxi_zone_lookup.parquet`
+- Copy `.env.example` to `.env` and set values (see below)
+
+**Steps:**
+
 ```bash
 # Step 1: Start infrastructure
 docker compose up -d
 
-# Step 2: Start the producer
-python produce.py
+# Wait ~20 seconds for all services to be ready
+sleep 20
 
-# Step 3: Run the pipeline
-<your command here>
+# Step 2: Create Kafka topic
+docker exec kafka sh -c "/opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9094 \
+  --create --topic taxi-trips --partitions 3 --replication-factor 1"
+
+# Step 3: Start the producer (from host PowerShell)
+python produce.py --rate 10
+
+# Step 4: Open Jupyter in browser
+# Navigate to http://localhost:8888
+# Token: bdm
+
+# Step 5a: Run the notebook (up to Section 4)
+# Open streaming_pipeline.ipynb and run cells through Section 4
+# Let producer run for 1-2 minutes to accumulate data
+# Monitor bronze_query.status to verify stream is active
+
+# Step 5b: Run restart proof (Section 5)
+# BEFORE running the restart proof cell, STOP the producer: Ctrl+C from PowerShell
+# Then return to Jupyter and run the "Restart Proof" cell
+# Row count should remain unchanged after restart (0 rows added)
 ```
 
-_Add any additional steps or dependencies needed to reproduce your results._
+**Required .env values for grader:**
 
-_Include the `.env` values the grader should use to run your project._
+```env
+JUPYTER_TOKEN=bdm
+MINIO_ROOT_USER=minioadmin
+MINIO_ROOT_PASSWORD=minioadmin
+AWS_ACCESS_KEY_ID=minioadmin
+AWS_SECRET_ACCESS_KEY=minioadmin
+AWS_REGION=us-east-1
+```
