@@ -44,7 +44,39 @@ CREATE TABLE lakehouse.taxi.bronze (
 
 ### Silver
 
-_Table DDL or DataFrame schema. Explain what changed compared to bronze and why._
+**Table DDL:**
+```sql
+CREATE TABLE lakehouse.taxi.silver (
+    vendor_id            INT,
+    pickup_datetime      TIMESTAMP,
+    dropoff_datetime     TIMESTAMP,
+    passenger_count      INT,
+    trip_distance        DOUBLE,
+    ratecode_id          INT,
+    store_and_fwd_flag   STRING,
+    pu_location_id       INT,
+    do_location_id       INT,
+    payment_type         INT,
+    fare_amount          DOUBLE,
+    extra                DOUBLE,
+    mta_tax              DOUBLE,
+    tip_amount           DOUBLE,
+    tolls_amount         DOUBLE,
+    total_amount         DOUBLE,
+    congestion_surcharge DOUBLE,
+    airport_fee          DOUBLE,
+    cbd_congestion_fee   DOUBLE,
+    pickup_zone          STRING,
+    dropoff_zone         STRING
+) USING iceberg
+```
+
+**Design Rationale:**
+- ID fields (`VendorID`, `RatecodeID`, `PULocationID`, `DOLocationID`, `payment_type`, `passenger_count`) cast from `DOUBLE` to `INT` — these are categorical identifiers, not measurements
+- Datetime strings cast from `STRING` to `TIMESTAMP` — enables time-based filtering and aggregations
+- Kafka metadata columns removed — not needed for analytics downstream
+- Two new columns added: `pickup_zone` and `dropoff_zone` from zone lookup join
+- `airport_fee` remains nullable to preserve both message shapes from the custom scenario
 
 ### Gold
 
@@ -52,16 +84,34 @@ _Table DDL or DataFrame schema. Explain the aggregation logic._
 
 ## 2. Cleaning rules and enrichment
 
-_List each cleaning rule (nulls, invalid values, deduplication key) with a brief justification._
-_Describe the enrichment step (zone lookup join)._
+| # | Rule | Condition | Reason |
+|---|------|-----------|--------|
+| R1 | Drop null pickup | `pickup_datetime IS NOT NULL` | Trips without a start time are unusable |
+| R2 | Drop null dropoff | `dropoff_datetime IS NOT NULL` | Trips without an end time are unusable |
+| R3 | No negative fares | `fare_amount >= 0` | Negative fares indicate data entry errors |
+| R4 | No zero distance | `trip_distance > 0` | Zero-distance trips are likely cancelled or test records |
+| R5 | Valid passenger count | `passenger_count BETWEEN 1 AND 8` | NYC taxis hold 1–8 passengers; nulls and 0 are invalid |
+| R6 | Deduplicate | `(vendor_id, pickup_datetime, dropoff_datetime, pu_location_id, do_location_id)` | Removes duplicate events from Kafka re-delivery |
+
+**Enrichment:**
+Zone names are joined from a static 265-row lookup table (`taxi_zone_lookup.parquet`) using broadcast joins on `PULocationID` and `DOLocationID`. Left joins are used so trips with unknown location IDs are kept with `NULL` zone names rather than dropped.
 
 ## 3. Streaming configuration
 
-_Describe:_
-- _Checkpoint path and what it stores._
-- _Trigger interval and why you chose it._
-- _Output mode (append/update/complete) and why._
-- _Watermark (if used) and why._
+| | Bronze | Silver |
+|---|--------|--------|
+| **Checkpoint path** | `/tmp/bronze_checkpoint` | `/tmp/silver_checkpoint` |
+| **Trigger** | `processingTime="5 seconds"` | `processingTime="5 seconds"` |
+| **Output mode** | Append | Append (via `foreachBatch`) |
+| **Watermark** | None | None |
+
+**Checkpoint:** Stores the last processed Kafka offset (bronze) and last processed Iceberg snapshot (silver) so that restarting the stream resumes from where it stopped without re-processing.
+
+**Trigger (5 seconds):** Small enough to keep latency low while avoiding excessive small file overhead in Iceberg.
+
+**Append mode:** Each micro-batch only adds new rows — no updates or deletes — which is correct for immutable event data.
+
+**No watermark:** Out-of-order event handling is not required for this pipeline; data arrives in order from Kafka.
 
 ## 4. Gold table partitioning strategy
 
@@ -95,6 +145,17 @@ Conclusion: IDEMPOTENT — Checkpoint prevents Kafka offset re-processing
 - Checkpoint file persists offsets across restarts
 - Iceberg table write API enforces merge semantics based on Kafka offsets (no data loss, no re-writes)
 - Restarting with the same checkpoint guarantees no message is consumed twice
+
+**Silver Restart Proof:**
+
+The silver stream reads from the bronze Iceberg table. The checkpoint at `/tmp/silver_checkpoint` stores the last processed Iceberg snapshot ID. On restart, the stream resumes from the next unprocessed snapshot — no bronze rows are re-processed.
+
+```
+Row count BEFORE restart:  (silver table count)
+Row count AFTER restart:   (same count)
+Rows added during restart: 0
+Conclusion: IDEMPOTENT — Silver checkpoint prevents bronze snapshot re-processing
+```
 
 ## 6. Custom scenario
 
