@@ -96,7 +96,7 @@ def main() -> None:
         description="Replay taxi trip parquet rows into Kafka.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--data-dir",  default="data/inbox",
+    parser.add_argument("--data-dir",  default="data",
                         help="Directory containing parquet files (relative to this script).")
     parser.add_argument("--data-file", default=None,
                         help="Specific parquet file to replay (relative to script). "

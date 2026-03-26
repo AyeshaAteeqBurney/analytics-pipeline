@@ -5,6 +5,7 @@
 ### Bronze
 
 **Table DDL:**
+
 ```sql
 CREATE TABLE lakehouse.taxi.bronze (
     VendorID DOUBLE,
@@ -35,6 +36,7 @@ CREATE TABLE lakehouse.taxi.bronze (
 ```
 
 **Design Rationale:**
+
 - Stores raw JSON events from Kafka as-is with minimal transformation
 - All numeric fields cast to DOUBLE for flexibility (handles schema variations)
 - Date/time strings kept as STRING for date-agnostic storage
@@ -45,6 +47,7 @@ CREATE TABLE lakehouse.taxi.bronze (
 ### Silver
 
 **Table DDL:**
+
 ```sql
 CREATE TABLE lakehouse.taxi.silver (
     vendor_id            INT,
@@ -72,6 +75,7 @@ CREATE TABLE lakehouse.taxi.silver (
 ```
 
 **Design Rationale:**
+
 - ID fields (`VendorID`, `RatecodeID`, `PULocationID`, `DOLocationID`, `payment_type`, `passenger_count`) cast from `DOUBLE` to `INT` — these are categorical identifiers, not measurements
 - Datetime strings cast from `STRING` to `TIMESTAMP` — enables time-based filtering and aggregations
 - Kafka metadata columns removed — not needed for analytics downstream
@@ -80,30 +84,51 @@ CREATE TABLE lakehouse.taxi.silver (
 
 ### Gold
 
-_Table DDL or DataFrame schema. Explain the aggregation logic._
+**Table DDL:**
+
+```sql
+CREATE TABLE lakehouse.taxi.gold (
+    pickup_hour    TIMESTAMP,
+    pickup_zone    STRING,
+    trip_count     LONG,
+    avg_fare       DOUBLE,
+    avg_distance   DOUBLE,
+    total_revenue  DOUBLE
+) USING iceberg
+PARTITIONED BY (days(pickup_hour))
+```
+
+**Aggregation logic:**
+Groups silver rows by hour (truncated from `pickup_datetime`) and `pickup_zone`, then computes trip count, average fare, average distance, and total revenue per group.
+
+**Design Rationale:**
+
+- Silver has one row per trip — gold collapses those into one row per hour per zone
+- Kafka metadata and individual trip fields removed — only business metrics remain
+- Reduces silver rows to fewer aggregated gold rows for fast analytical queries
 
 ## 2. Cleaning rules and enrichment
 
-| # | Rule | Condition | Reason |
-|---|------|-----------|--------|
-| R1 | Drop null pickup | `pickup_datetime IS NOT NULL` | Trips without a start time are unusable |
-| R2 | Drop null dropoff | `dropoff_datetime IS NOT NULL` | Trips without an end time are unusable |
-| R3 | No negative fares | `fare_amount >= 0` | Negative fares indicate data entry errors |
-| R4 | No zero distance | `trip_distance > 0` | Zero-distance trips are likely cancelled or test records |
-| R5 | Valid passenger count | `passenger_count BETWEEN 1 AND 8` | NYC taxis hold 1–8 passengers; nulls and 0 are invalid |
-| R6 | Deduplicate | `(vendor_id, pickup_datetime, dropoff_datetime, pu_location_id, do_location_id)` | Removes duplicate events from Kafka re-delivery |
+| #   | Rule                  | Condition                                                                        | Reason                                                   |
+| --- | --------------------- | -------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| R1  | Drop null pickup      | `pickup_datetime IS NOT NULL`                                                    | Trips without a start time are unusable                  |
+| R2  | Drop null dropoff     | `dropoff_datetime IS NOT NULL`                                                   | Trips without an end time are unusable                   |
+| R3  | No negative fares     | `fare_amount >= 0`                                                               | Negative fares indicate data entry errors                |
+| R4  | No zero distance      | `trip_distance > 0`                                                              | Zero-distance trips are likely cancelled or test records |
+| R5  | Valid passenger count | `passenger_count BETWEEN 1 AND 8`                                                | NYC taxis hold 1–8 passengers; nulls and 0 are invalid   |
+| R6  | Deduplicate           | `(vendor_id, pickup_datetime, dropoff_datetime, pu_location_id, do_location_id)` | Removes duplicate events from Kafka re-delivery          |
 
 **Enrichment:**
 Zone names are joined from a static 265-row lookup table (`taxi_zone_lookup.parquet`) using broadcast joins on `PULocationID` and `DOLocationID`. Left joins are used so trips with unknown location IDs are kept with `NULL` zone names rather than dropped.
 
 ## 3. Streaming configuration
 
-| | Bronze | Silver |
-|---|--------|--------|
-| **Checkpoint path** | `/tmp/bronze_checkpoint` | `/tmp/silver_checkpoint` |
-| **Trigger** | `processingTime="5 seconds"` | `processingTime="5 seconds"` |
-| **Output mode** | Append | Append (via `foreachBatch`) |
-| **Watermark** | None | None |
+|                     | Bronze                       | Silver                       |
+| ------------------- | ---------------------------- | ---------------------------- |
+| **Checkpoint path** | `/tmp/bronze_checkpoint`     | `/tmp/silver_checkpoint`     |
+| **Trigger**         | `processingTime="5 seconds"` | `processingTime="5 seconds"` |
+| **Output mode**     | Append                       | Append (via `foreachBatch`)  |
+| **Watermark**       | None                         | None                         |
 
 **Checkpoint:** Stores the last processed Kafka offset (bronze) and last processed Iceberg snapshot (silver) so that restarting the stream resumes from where it stopped without re-processing.
 
@@ -115,8 +140,17 @@ Zone names are joined from a static 265-row lookup table (`taxi_zone_lookup.parq
 
 ## 4. Gold table partitioning strategy
 
-_Explain your partitioning choice. Why this column(s)? What query patterns does it optimize?_
-_Show the Iceberg snapshot history (query output or screenshot)._
+The gold table is partitioned by `days(pickup_hour)`. Most analytics queries filter by date range (e.g. daily or weekly trends), so day-level partitioning lets Iceberg skip irrelevant files entirely. Hourly partitioning would create too many small partitions (~720/month), while monthly would be too coarse for typical queries.
+
+**Iceberg snapshot history:**
+
+```
++-----------------------+-------------------+---------+-------------------+
+|made_current_at        |snapshot_id        |parent_id|is_current_ancestor|
++-----------------------+-------------------+---------+-------------------+
+|2026-03-26 15:24:55.653|5262274882016129340|NULL     |true               |
++-----------------------+-------------------+---------+-------------------+
+```
 
 ## 5. Restart proof
 
@@ -124,6 +158,7 @@ _Show the Iceberg snapshot history (query output or screenshot)._
 Spark Structured Streaming tracks the last processed Kafka offset in `/tmp/bronze_checkpoint/offsets/`. When the stream restarts, it reads this checkpoint and resumes from the saved offset, skipping all previously ingested messages.
 
 **Test Procedure:**
+
 1. Run producer and stream until Bronze table reaches ~7M rows
 2. Stop the producer (Ctrl+C) to freeze message input
 3. Stop the stream (bronze_query.stop())
@@ -133,6 +168,7 @@ Spark Structured Streaming tracks the last processed Kafka offset in `/tmp/bronz
 7. Verify row count remains: 7,000,000 rows
 
 **Result:**
+
 ```
 Row count BEFORE restart:  7,000,000
 Row count AFTER restart:   7,000,000
@@ -141,6 +177,7 @@ Conclusion: IDEMPOTENT — Checkpoint prevents Kafka offset re-processing
 ```
 
 **Why duplicates did NOT appear:**
+
 - Kafka offset uniqueness (partition + offset) is deterministic
 - Checkpoint file persists offsets across restarts
 - Iceberg table write API enforces merge semantics based on Kafka offsets (no data loss, no re-writes)
@@ -160,6 +197,7 @@ Conclusion: IDEMPOTENT — Silver checkpoint prevents bronze snapshot re-process
 ## 6. Custom scenario
 
 **Requirement:** Producer sends two message shapes:
+
 - Rows 1–500: No `airport_fee` field
 - Rows 501+: Include `airport_fee: 1.75`
 
@@ -168,6 +206,7 @@ Ensure Bronze layer accepts both without errors or data loss.
 **Implementation:**
 
 In `produce.py`, after row 500:
+
 ```python
 # Rows 1-500: normal message (no airport_fee)
 # Rows 501+: add airport_fee to msg dict
@@ -176,6 +215,7 @@ if row_index > 500:
 ```
 
 In notebook Bronze schema definition:
+
 ```python
 StructField("airport_fee", DoubleType(), True)  # nullable=True
 ```
@@ -185,6 +225,7 @@ StructField("airport_fee", DoubleType(), True)  # nullable=True
 Two message shapes coexist in Bronze without data loss:
 
 **Messages WITHOUT airport_fee (rows 1–500):**
+
 ```
 | VendorID | fare_amount | airport_fee |
 |----------|-------------|-------------|
@@ -193,6 +234,7 @@ Two message shapes coexist in Bronze without data loss:
 ```
 
 **Messages WITH airport_fee (rows 501+):**
+
 ```
 | VendorID | fare_amount | airport_fee |
 |----------|-------------|-------------|
@@ -201,6 +243,7 @@ Two message shapes coexist in Bronze without data loss:
 ```
 
 **Verification:**
+
 - Count WITHOUT airport_fee: ~500 rows (original file rows, first 500)
 - Count WITH airport_fee: ~7M - 500 ≈ ~6.999M rows (rows 501+ from all files)
 - Total rows in Bronze: ~7M (no data loss)
@@ -211,6 +254,7 @@ Two message shapes coexist in Bronze without data loss:
 ## 7. How to run
 
 **Prerequisites:**
+
 - Place parquet files in `data/` directory:
   - `data/yellow_tripdata_2025-01.parquet`
   - `data/yellow_tripdata_2025-02.parquet`
