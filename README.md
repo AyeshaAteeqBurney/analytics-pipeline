@@ -39,7 +39,7 @@ cp .env.example .env
 
 The `.env` file is git-ignored and never committed.
 
-You need to change all the default secrets, and provide them in `REPORT.md` section 7 in your project submission. 
+You need to change all the default secrets. For grading, use the `.env` values documented in **`REPORT.md` §7 — How to run** (or document your own there).
 
 ### 2. Place the data files
 
@@ -228,6 +228,8 @@ raw_stream = (
 zones = spark.read.parquet("data/taxi_zone_lookup.parquet")
 zones.show(5)
 ```
+
+**End-to-end / grading steps** are spelled out in **`REPORT.md` §7 — How to run** (topic creation, producer, Jupyter, `.env`).
 
 ---
 

@@ -4,7 +4,7 @@
 
 ### Bronze
 
-**Table DDL:**
+Table DDL:
 
 ```sql
 CREATE TABLE lakehouse.taxi.bronze (
@@ -35,18 +35,11 @@ CREATE TABLE lakehouse.taxi.bronze (
 ) USING iceberg
 ```
 
-**Design Rationale:**
-
-- Stores raw JSON events from Kafka as-is with minimal transformation
-- All numeric fields cast to DOUBLE for flexibility (handles schema variations)
-- Date/time strings kept as STRING for date-agnostic storage
-- **airport_fee is NULLABLE** to support schema evolution: rows 1-500 have no airport_fee; rows 501+ include it (value 1.75)
-- Kafka metadata columns (partition, offset, timestamp) enable audit trail and offset tracking for idempotency
-- ingested_at captures pipeline processing time (not source time)
+What is stored and why it is kept as-is: Bronze holds the taxi payload fields as they arrive from Kafka JSON, with types relaxed to `DOUBLE` / `STRING` so minor schema variation still parses. Datetimes stay strings to preserve the raw source form. Kafka columns (`kafka_key`, `kafka_timestamp`, `kafka_partition`, `kafka_offset`) and `ingested_at` provide lineage and support offset-based reasoning. `airport_fee` is nullable so messages with and without that key (custom scenario) load without failure.
 
 ### Silver
 
-**Table DDL:**
+Table DDL:
 
 ```sql
 CREATE TABLE lakehouse.taxi.silver (
@@ -74,17 +67,11 @@ CREATE TABLE lakehouse.taxi.silver (
 ) USING iceberg
 ```
 
-**Design Rationale:**
-
-- ID fields (`VendorID`, `RatecodeID`, `PULocationID`, `DOLocationID`, `payment_type`, `passenger_count`) cast from `DOUBLE` to `INT` — these are categorical identifiers, not measurements
-- Datetime strings cast from `STRING` to `TIMESTAMP` — enables time-based filtering and aggregations
-- Kafka metadata columns removed — not needed for analytics downstream
-- Two new columns added: `pickup_zone` and `dropoff_zone` from zone lookup join
-- `airport_fee` remains nullable to preserve both message shapes from the custom scenario
+What changed compared to bronze and why: IDs and `passenger_count` are `INT` because they are categorical, not continuous measurements. Pickup/dropoff are `TIMESTAMP` for filtering, windows, and gold time bucketing. Kafka metadata is dropped—downstream analytics do not need it. `pickup_zone` and `dropoff_zone` are added after the zone lookup join. Naming is normalized (`vendor_id`, `pu_location_id`, etc.) for readability.
 
 ### Gold
 
-**Table DDL:**
+Table DDL:
 
 ```sql
 CREATE TABLE lakehouse.taxi.gold (
@@ -98,202 +85,107 @@ CREATE TABLE lakehouse.taxi.gold (
 PARTITIONED BY (days(pickup_hour))
 ```
 
-**Aggregation logic:**
-Groups silver rows by hour (truncated from `pickup_datetime`) and `pickup_zone`, then computes trip count, average fare, average distance, and total revenue per group.
+Aggregation logic: From silver, `pickup_hour = date_trunc('hour', pickup_datetime)`. Group by `pickup_hour` and `pickup_zone`. Metrics: `count(*)` as `trip_count`, `avg(fare_amount)`, `avg(trip_distance)`, `sum(total_amount)` as `total_revenue`. That supports queries filtered by hour and pickup zone.
 
-**Design Rationale:**
-
-- Silver has one row per trip — gold collapses those into one row per hour per zone
-- Kafka metadata and individual trip fields removed — only business metrics remain
-- Reduces silver rows to fewer aggregated gold rows for fast analytical queries
+---
 
 ## 2. Cleaning rules and enrichment
 
-| #   | Rule                  | Condition                                                                        | Reason                                                   |
-| --- | --------------------- | -------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| R1  | Drop null pickup      | `pickup_datetime IS NOT NULL`                                                    | Trips without a start time are unusable                  |
-| R2  | Drop null dropoff     | `dropoff_datetime IS NOT NULL`                                                   | Trips without an end time are unusable                   |
-| R3  | No negative fares     | `fare_amount >= 0`                                                               | Negative fares indicate data entry errors                |
-| R4  | No zero distance      | `trip_distance > 0`                                                              | Zero-distance trips are likely cancelled or test records |
-| R5  | Valid passenger count | `passenger_count BETWEEN 1 AND 8`                                                | NYC taxis hold 1–8 passengers; nulls and 0 are invalid   |
-| R6  | Deduplicate           | `(vendor_id, pickup_datetime, dropoff_datetime, pu_location_id, do_location_id)` | Removes duplicate events from Kafka re-delivery          |
+| Rule | Condition | Justification |
+| --- | --- | --- |
+| R1 | `pickup_datetime IS NOT NULL` | Trips without a start time are unusable for duration or time analytics. |
+| R2 | `dropoff_datetime IS NOT NULL` | Same for end time. |
+| R3 | `fare_amount >= 0` | Negative fares indicate bad or test data. |
+| R4 | `trip_distance > 0` | Zero-distance rows are usually cancellations or noise. |
+| R5 | `passenger_count` between 1 and 8 (and not null) | Matches realistic NYC taxi capacity; excludes null and zero. |
+| R6 (dedup) | `dropDuplicates(vendor_id, pickup_datetime, dropoff_datetime, pu_location_id, do_location_id)` | Treats duplicate Kafka deliveries of the same trip as one silver row. |
 
-**Enrichment:**
-Zone names are joined from a static 265-row lookup table (`taxi_zone_lookup.parquet`) using broadcast joins on `PULocationID` and `DOLocationID`. Left joins are used so trips with unknown location IDs are kept with `NULL` zone names rather than dropped.
+Enrichment: Load `taxi_zone_lookup.parquet` (265 zones). Broadcast left joins: `pu_location_id` → `pickup_zone`, `do_location_id` → `dropoff_zone`, so unknown IDs remain as trips with `NULL` zone names instead of being dropped.
+
+---
 
 ## 3. Streaming configuration
 
-|                     | Bronze                       | Silver                       |
-| ------------------- | ---------------------------- | ---------------------------- |
-| **Checkpoint path** | `/tmp/bronze_checkpoint`     | `/tmp/silver_checkpoint`     |
-| **Trigger**         | `processingTime="5 seconds"` | `processingTime="5 seconds"` |
-| **Output mode**     | Append                       | Append (via `foreachBatch`)  |
-| **Watermark**       | None                         | None                         |
+- Checkpoint paths: `proj2/.checkpoints/bronze` and `proj2/.checkpoints/silver` on the host (inside the container: `/home/jovyan/project/.checkpoints/...`). The project folder is Docker-mounted so you can delete these folders from Windows Explorer to reset streaming state—not the machine’s unrelated `/tmp`, which Spark inside the container does not use for these paths. Each checkpoint stores Structured Streaming metadata: for bronze, committed Kafka offsets per partition; for silver, progress for the Iceberg streaming scan of bronze (snapshots processed). Restarting with the same path resumes after the last committed batch.
 
-**Checkpoint:** Stores the last processed Kafka offset (bronze) and last processed Iceberg snapshot (silver) so that restarting the stream resumes from where it stopped without re-processing.
+- Trigger: `processingTime = "5 seconds"` for both streams. Balances latency and Iceberg commit frequency so we do not create an excessive number of tiny files.
 
-**Trigger (5 seconds):** Small enough to keep latency low while avoiding excessive small file overhead in Iceberg.
+- Output mode: Append only. Each micro-batch adds new rows; we do not use update or complete mode because the pipeline models immutable events and curated append-only silver rows.
 
-**Append mode:** Each micro-batch only adds new rows — no updates or deletes — which is correct for immutable event data.
+- Watermark: Not used. Events are assumed sufficiently in-order from the producer/Kafka for this project; we do not need to drop late data in a windowed sense.
 
-**No watermark:** Out-of-order event handling is not required for this pipeline; data arrives in order from Kafka.
+- Silver (batch catch-up, then stream): The notebook calls `process_silver_batch` once on a batch read of bronze so existing rows become silver before the stream starts. The silver `readStream` uses its checkpoint to continue from new bronze commits only, so those rows are not written twice. The silver restart test (producer off) shows no extra rows after stop/restart.
+
+---
 
 ## 4. Gold table partitioning strategy
 
-The gold table is partitioned by `days(pickup_hour)`. Most analytics queries filter by date range (e.g. daily or weekly trends), so day-level partitioning lets Iceberg skip irrelevant files entirely. Hourly partitioning would create too many small partitions (~720/month), while monthly would be too coarse for typical queries.
+Gold is partitioned with `days(pickup_hour)`. Queries that slice by calendar day or week align with partition boundaries, so Iceberg can skip files outside the range. Hourly partitions would multiply small files; monthly partitions would be too coarse for daily reporting.
 
-**Iceberg snapshot history:**
+Iceberg snapshot history (`SELECT * FROM lakehouse.taxi.gold.history` — example run):
 
 ```
 +-----------------------+-------------------+---------+-------------------+
 |made_current_at        |snapshot_id        |parent_id|is_current_ancestor|
 +-----------------------+-------------------+---------+-------------------+
-|2026-03-26 15:24:55.653|5262274882016129340|NULL     |true               |
+|2026-04-03 09:53:56.056|5436408693480973246|NULL     |true               |
 +-----------------------+-------------------+---------+-------------------+
 ```
 
+Bronze and silver accumulate more snapshots over time; the notebook prints full `.history` for those tables as well.
+
+---
+
 ## 5. Restart proof
 
-**Checkpoint Mechanism:**
-Spark Structured Streaming tracks the last processed Kafka offset in `/tmp/bronze_checkpoint/offsets/`. When the stream restarts, it reads this checkpoint and resumes from the saved offset, skipping all previously ingested messages.
+With `produce.py` stopped (Ctrl+C) so no new messages arrive, we stop the streaming query, restart it with the same `checkpointLocation`, wait ~15 seconds, and compare `SELECT COUNT(*)` on the table.
 
-**Test Procedure:**
+| Layer | Rows before restart | Rows after restart | Rows added |
+| --- | ---:| ---:| ---:|
+| Bronze | 4,136 | 4,136 | 0 |
+| Silver | 3,978 | 3,978 | 0 |
 
-1. Run producer and stream until Bronze table reaches ~7M rows
-2. Stop the producer (Ctrl+C) to freeze message input
-3. Stop the stream (bronze_query.stop())
-4. Note row count: 7,000,000 rows
-5. Restart stream from the same checkpoint
-6. Wait 15 seconds; no new messages arrive (producer was stopped)
-7. Verify row count remains: 7,000,000 rows
+Conclusion: No duplicate rows from re-processing already committed inputs. Idempotency comes from Structured Streaming checkpoints and the saved Kafka offsets (bronze) and Iceberg source progress (silver), not from Iceberg merge/upsert on business keys. Bronze writes remain append to Iceberg.
 
-**Result:**
+Numbers from our demo run (partial ingest).
 
-```
-Row count BEFORE restart:  7,000,000
-Row count AFTER restart:   7,000,000
-Rows added during restart: 0
-Conclusion: IDEMPOTENT — Checkpoint prevents Kafka offset re-processing
-```
-
-**Why duplicates did NOT appear:**
-
-- Kafka offset uniqueness (partition + offset) is deterministic
-- Checkpoint file persists offsets across restarts
-- Iceberg table write API enforces merge semantics based on Kafka offsets (no data loss, no re-writes)
-- Restarting with the same checkpoint guarantees no message is consumed twice
-
-**Silver Restart Proof:**
-
-The silver stream reads from the bronze Iceberg table. The checkpoint at `/tmp/silver_checkpoint` stores the last processed Iceberg snapshot ID. On restart, the stream resumes from the next unprocessed snapshot — no bronze rows are re-processed.
-
-```
-Row count BEFORE restart:  (silver table count)
-Row count AFTER restart:   (same count)
-Rows added during restart: 0
-Conclusion: IDEMPOTENT — Silver checkpoint prevents bronze snapshot re-processing
-```
+---
 
 ## 6. Custom scenario
 
-**Requirement:** Producer sends two message shapes:
+GitHub issue requirement: For each parquet file replayed by the producer, rows 1–500 are sent without an `airport_fee` field; from row 501 onward the JSON includes `airport_fee: 1.75`. Bronze must accept both shapes without errors or row loss.
 
-- Rows 1–500: No `airport_fee` field
-- Rows 501+: Include `airport_fee: 1.75`
+Implementation: In `produce.py`, each row is built from the parquet dict; TLC’s `Airport_fee` key is removed, `airport_fee` is omitted for `row_idx <= 500`, and `airport_fee = 1.75` is set for `row_idx > 500` so JSON keys match Spark’s lowercase `airport_fee`. In Spark, `StructField("airport_fee", DoubleType(), True)` and the bronze Iceberg column are nullable `DOUBLE`.
 
-Ensure Bronze layer accepts both without errors or data loss.
+Verification: Query bronze with `airport_fee IS NULL` vs `IS NOT NULL`—the first 500 trips per file show NULL fee; later rows show 1.75. Total ingested count matches expectations for the producer run; both shapes land in one table.
 
-**Implementation:**
-
-In `produce.py`, after row 500:
-
-```python
-# Rows 1-500: normal message (no airport_fee)
-# Rows 501+: add airport_fee to msg dict
-if row_index > 500:
-    row["airport_fee"] = 1.75
-```
-
-In notebook Bronze schema definition:
-
-```python
-StructField("airport_fee", DoubleType(), True)  # nullable=True
-```
-
-**Proof of Success:**
-
-Two message shapes coexist in Bronze without data loss:
-
-**Messages WITHOUT airport_fee (rows 1–500):**
-
-```
-| VendorID | fare_amount | airport_fee |
-|----------|-------------|-------------|
-| 1        | 5.20        | NULL        |
-| 2        | 8.50        | NULL        |
-```
-
-**Messages WITH airport_fee (rows 501+):**
-
-```
-| VendorID | fare_amount | airport_fee |
-|----------|-------------|-------------|
-| 1        | 12.75       | 1.75        |
-| 2        | 15.30       | 1.75        |
-```
-
-**Verification:**
-
-- Count WITHOUT airport_fee: ~500 rows (original file rows, first 500)
-- Count WITH airport_fee: ~7M - 500 ≈ ~6.999M rows (rows 501+ from all files)
-- Total rows in Bronze: ~7M (no data loss)
-- Schema union: Both shapes stored together using nullable airport_fee field
-
-**Result:** Schema evolution successful — nullable field design accommodates multiple message versions without schema errors or row loss
+---
 
 ## 7. How to run
 
-**Prerequisites:**
-
-- Place parquet files in `data/` directory:
-  - `data/yellow_tripdata_2025-01.parquet`
-  - `data/yellow_tripdata_2025-02.parquet`
-  - `data/taxi_zone_lookup.parquet`
-- Copy `.env.example` to `.env` and set values (see below)
-
-**Steps:**
+Dependencies: Docker; Python 3 with `kafka-python-ng`, `pandas`, `pyarrow` (producer installs missing packages on first run). Parquet files in `data/` as listed below.
 
 ```bash
 # Step 1: Start infrastructure
 docker compose up -d
+# Wait ~20s for Kafka, MinIO, Iceberg REST, Jupyter
 
-# Wait ~20 seconds for all services to be ready
-sleep 20
-
-# Step 2: Create Kafka topic
+# Step 2: Create Kafka topic (once)
 docker exec kafka sh -c "/opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server localhost:9094 \
   --create --topic taxi-trips --partitions 3 --replication-factor 1"
 
-# Step 3: Start the producer (from host PowerShell)
+# Step 3: Start the producer (from project root on the host)
 python produce.py --rate 10
-
-# Step 4: Open Jupyter in browser
-# Navigate to http://localhost:8888
-# Token: bdm
-
-# Step 5a: Run the notebook (up to Section 4)
-# Open streaming_pipeline.ipynb and run cells through Section 4
-# Let producer run for 1-2 minutes to accumulate data
-# Monitor bronze_query.status to verify stream is active
-
-# Step 5b: Run restart proof (Section 5)
-# BEFORE running the restart proof cell, STOP the producer: Ctrl+C from PowerShell
-# Then return to Jupyter and run the "Restart Proof" cell
-# Row count should remain unchanged after restart (0 rows added)
 ```
 
-**Required .env values for grader:**
+Step 4 — Run the pipeline: Open http://localhost:8888, open `streaming_pipeline.ipynb` (files under `~/project/` in the container), run cells in order. For restart proof cells, stop the producer first (Ctrl+C) so counts stay stable.
+
+Data files (place under `data/`):
+
+- `yellow_tripdata_2025-01.parquet`, `yellow_tripdata_2025-02.parquet`, `taxi_zone_lookup.parquet`
+
+`.env` values for the grader (copy from `.env.example` and align with these if using defaults):
 
 ```env
 JUPYTER_TOKEN=bdm
@@ -303,3 +195,5 @@ AWS_ACCESS_KEY_ID=minioadmin
 AWS_SECRET_ACCESS_KEY=minioadmin
 AWS_REGION=us-east-1
 ```
+
+Note: Producer in host mode uses `localhost:9094`; the notebook inside Docker uses `kafka:9092` for the Kafka bootstrap server.

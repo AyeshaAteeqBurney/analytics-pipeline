@@ -132,6 +132,9 @@ data/input/*
 data/output/*
 !data/output/.gitkeep
 
+# Spark Structured Streaming checkpoints (mounted from container)
+.checkpoints/
+
 # Spark / PySpark
 metastore_db/
 derby.log

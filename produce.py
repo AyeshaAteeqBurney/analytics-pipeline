@@ -190,8 +190,10 @@ def main() -> None:
 
                 for row_idx, (_, row) in enumerate(df.iterrows(), start=1):
                     msg = row.to_dict()
-                    
-                    # Custom scenario: add airport_fee after row 500
+                    # TLC parquet may use "Airport_fee"; Spark from_json expects "airport_fee" (case-sensitive).
+                    # Custom scenario: rows 1–500 omit airport_fee; rows 501+ set airport_fee = 1.75
+                    msg.pop("Airport_fee", None)
+                    msg.pop("airport_fee", None)
                     if row_idx > 500:
                         msg["airport_fee"] = 1.75
                     
