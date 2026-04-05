@@ -128,9 +128,11 @@ Iceberg snapshot history (`SELECT * FROM lakehouse.taxi.gold.history` — exampl
 +-----------------------+-------------------+---------+-------------------+
 |made_current_at        |snapshot_id        |parent_id|is_current_ancestor|
 +-----------------------+-------------------+---------+-------------------+
-|2026-04-03 09:53:56.056|5436408693480973246|NULL     |true               |
+|2026-04-05 13:06:45.932|2419342497064913156|NULL     |true               |
 +-----------------------+-------------------+---------+-------------------+
 ```
+
+In the same saved run, `lakehouse.taxi.gold` holds **80** rows after `overwritePartitions()` (hour × zone groups).
 
 Bronze and silver accumulate more snapshots over time; the notebook prints full `.history` for those tables as well.
 
@@ -142,12 +144,14 @@ With `produce.py` stopped (Ctrl+C) so no new messages arrive, we stop the stream
 
 | Layer | Rows before restart | Rows after restart | Rows added |
 | --- | ---:| ---:| ---:|
-| Bronze | 4,136 | 4,136 | 0 |
-| Silver | 3,978 | 3,978 | 0 |
+| Bronze | 1,762 | 1,762 | 0 |
+| Silver | 1,708 | 1,708 | 0 |
 
 Conclusion: No duplicate rows from re-processing already committed inputs. Idempotency comes from Structured Streaming checkpoints and the saved Kafka offsets (bronze) and Iceberg source progress (silver), not from Iceberg merge/upsert on business keys. Bronze writes remain append to Iceberg.
 
-Numbers from our demo run (partial ingest).
+Silver has fewer rows than bronze in this run because silver applies cleaning rules and `dropDuplicates` (§2); the restart table counts match the saved outputs in `streaming_pipeline.ipynb`.
+
+Numbers from our demo run (partial ingest; one trip parquet in this pass, hence 500 bronze rows with `airport_fee` NULL).
 
 ---
 
